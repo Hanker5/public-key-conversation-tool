@@ -22,14 +22,9 @@ function base64ToBuffer(base64) {
 
 export async function generateKeyPair() {
   return crypto.subtle.generateKey(
-    {
-      name: 'RSA-OAEP',
-      modulusLength: 2048,
-      publicExponent: new Uint8Array([1, 0, 1]),
-      hash: 'SHA-256',
-    },
+    { name: 'ECDH', namedCurve: 'P-256' },
     true,
-    ['encrypt', 'decrypt'],
+    ['deriveKey', 'deriveBits'],
   )
 }
 
@@ -61,16 +56,16 @@ export async function importKeyPairFromJwk({ publicJwk, privateJwk }) {
   const publicKey = await crypto.subtle.importKey(
     'jwk',
     publicJwk,
-    { name: 'RSA-OAEP', hash: 'SHA-256' },
+    { name: 'ECDH', namedCurve: 'P-256' },
     true,
-    ['encrypt'],
+    [],
   )
   const privateKey = await crypto.subtle.importKey(
     'jwk',
     privateJwk,
-    { name: 'RSA-OAEP', hash: 'SHA-256' },
+    { name: 'ECDH', namedCurve: 'P-256' },
     true,
-    ['decrypt'],
+    ['deriveKey', 'deriveBits'],
   )
   return { publicKey, privateKey }
 }
@@ -86,88 +81,100 @@ export async function importPublicKeyFromPem(pem) {
   return crypto.subtle.importKey(
     'spki',
     buffer,
-    { name: 'RSA-OAEP', hash: 'SHA-256' },
+    { name: 'ECDH', namedCurve: 'P-256' },
     true,
-    ['encrypt'],
+    [],
   )
 }
 
-// --- Hybrid encryption: RSA-OAEP wraps an AES-GCM key ---
-// Produces a single base64 string safe to paste anywhere.
+// --- Hybrid encryption: ECDH key agreement + AES-GCM ---
+// Produces a compact binary base64 string safe to paste anywhere.
+// Format: [0x02 version][65B ephemeral P-256 pubkey][12B IV][ciphertext+tag]
 
 export async function encryptMessage(plaintext, recipientPublicKey) {
-  // 1. One-time AES-256-GCM key
-  const aesKey = await crypto.subtle.generateKey(
-    { name: 'AES-GCM', length: 256 },
+  // 1. One-time ephemeral P-256 key pair
+  const ephemeral = await crypto.subtle.generateKey(
+    { name: 'ECDH', namedCurve: 'P-256' },
     true,
-    ['encrypt', 'decrypt'],
+    ['deriveKey'],
   )
 
-  // 2. Random 96-bit IV
-  const iv = crypto.getRandomValues(new Uint8Array(12))
+  // 2. Derive shared AES-256-GCM key (ephemeral private × recipient public)
+  const aesKey = await crypto.subtle.deriveKey(
+    { name: 'ECDH', public: recipientPublicKey },
+    ephemeral.privateKey,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt'],
+  )
 
-  // 3. Encrypt message with AES-GCM
-  const encoder = new TextEncoder()
+  // 3. Random 96-bit IV + encrypt message
+  const iv = crypto.getRandomValues(new Uint8Array(12))
   const ciphertext = await crypto.subtle.encrypt(
     { name: 'AES-GCM', iv },
     aesKey,
-    encoder.encode(plaintext),
+    new TextEncoder().encode(plaintext),
   )
 
-  // 4. Wrap the AES key with recipient's RSA public key
-  const rawAesKey = await crypto.subtle.exportKey('raw', aesKey)
-  const encryptedKey = await crypto.subtle.encrypt(
-    { name: 'RSA-OAEP' },
-    recipientPublicKey,
-    rawAesKey,
-  )
+  // 4. Export ephemeral public key as raw bytes (65 bytes uncompressed)
+  const ephemeralPubRaw = await crypto.subtle.exportKey('raw', ephemeral.publicKey)
 
-  // 5. Bundle everything into a compact base64 payload
-  const payload = {
-    v: 1,
-    k: bufferToBase64(encryptedKey),
-    i: bufferToBase64(iv),
-    c: bufferToBase64(ciphertext),
-  }
-
-  return btoa(JSON.stringify(payload))
+  // 5. Pack into binary: [0x02][ephemeral pubkey 65B][iv 12B][ciphertext]
+  const blob = new Uint8Array(1 + 65 + 12 + ciphertext.byteLength)
+  blob[0] = 0x02
+  blob.set(new Uint8Array(ephemeralPubRaw), 1)
+  blob.set(iv, 66)
+  blob.set(new Uint8Array(ciphertext), 78)
+  return bufferToBase64(blob.buffer)
 }
 
 // --- Hybrid decryption ---
 
 export async function decryptMessage(encryptedData, privateKey) {
-  let payload
+  let bytes
   try {
-    payload = JSON.parse(atob(encryptedData))
+    bytes = new Uint8Array(base64ToBuffer(encryptedData))
   } catch {
     throw new Error('Invalid message format — make sure you pasted the full encrypted block.')
   }
 
-  if (payload.v !== 1) {
-    throw new Error(`Unknown message version: ${payload.v}`)
+  // Backwards compat: old v1 messages decode to JSON starting with '{'
+  if (bytes[0] === 0x7b) {
+    throw new Error('This message was encrypted with an older version of CryptoChat. Ask the sender to re-encrypt it.')
   }
 
-  // 1. Unwrap the AES key using our RSA private key
-  const rawAesKey = await crypto.subtle.decrypt(
-    { name: 'RSA-OAEP' },
-    privateKey,
-    base64ToBuffer(payload.k),
+  if (bytes[0] !== 0x02) {
+    throw new Error(`Unknown message version: ${bytes[0]}`)
+  }
+
+  // Parse binary layout: [0x02][65B ephemeral pubkey][12B IV][ciphertext]
+  const ephemeralPubRaw = bytes.slice(1, 66).buffer
+  const iv = bytes.slice(66, 78)
+  const ciphertext = bytes.slice(78).buffer
+
+  // 1. Import ephemeral public key
+  const ephemeralPub = await crypto.subtle.importKey(
+    'raw',
+    ephemeralPubRaw,
+    { name: 'ECDH', namedCurve: 'P-256' },
+    false,
+    [],
   )
 
-  // 2. Re-import the AES key
-  const aesKey = await crypto.subtle.importKey(
-    'raw',
-    rawAesKey,
-    { name: 'AES-GCM' },
+  // 2. Derive the same shared AES key (own private × ephemeral public)
+  const aesKey = await crypto.subtle.deriveKey(
+    { name: 'ECDH', public: ephemeralPub },
+    privateKey,
+    { name: 'AES-GCM', length: 256 },
     false,
     ['decrypt'],
   )
 
   // 3. Decrypt the ciphertext
   const plainBuffer = await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv: base64ToBuffer(payload.i) },
+    { name: 'AES-GCM', iv },
     aesKey,
-    base64ToBuffer(payload.c),
+    ciphertext,
   )
 
   return new TextDecoder().decode(plainBuffer)
